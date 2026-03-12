@@ -1,7 +1,10 @@
 """
 Ping Quest Tool
 
-2026.03.09
+2026.03.09 initial release
+2026.03.11 display history in sidebar
+
+Copyright (c) 2026 Atsushi Kobayashi
 """
 
 APP_HELP = """\
@@ -12,13 +15,14 @@ Usage:
   streamlit run app/pingquest.py -- [options]
   
 Options:
-  -h, --help              Show this help message and exit
-  --geoip-dir PATH        Directory containing GeoLite2-City.mmdb and GeoLite2-ASN.mmdb
-                          Default: current directory
-  --map-home-lat FLOAT    Initial map center latitude
-                          Default: 35.681236 (Tokyo Station)
-  --map-home-lon FLOAT    Initial map center longitude
-                          Default: 139.767125 (Tokyo Station)
+  -h, --help                Show this help message and exit
+  --geoip-dir PATH          Directory containing GeoLite2-City.mmdb and GeoLite2-ASN.mmdb
+                            Default: current directory
+  --map-home-lat FLOAT      Initial map center latitude
+                            Default: 35.681236 (Tokyo Station)
+  --map-home-lon FLOAT      Initial map center longitude
+                            Default: 139.767125 (Tokyo Station)
+  --debug                   Enable debug mode
 
 Examples:
   streamlit run app/pingquest.py
@@ -45,7 +49,8 @@ from streamlit.runtime.scriptrunner import get_script_run_ctx
 import urllib3.util.connection as urllib3_cn
 import socket
 from folium.plugins import PolyLineTextPath
-
+from collections import defaultdict
+from collections import Counter
 
 TEXT = {
     "title": {
@@ -77,6 +82,7 @@ TEXT = {
 }
 
 
+# 固定の変数
 class Params:
     APP_NAME = "Ping Quest"
     # Default map center (Tokyo Station)
@@ -87,19 +93,194 @@ class Params:
     ASN_DB_NAME = "GeoLite2-ASN.mmdb"
     # Map settings
     DEFAULT_ZOOM_LEVEL = 3
-    # UI
     PING_COMMAND = "ping"
     # 名前解決なし、待ち時間1000ms
     TRACEROUTE_COMMAND = "tracert /d /w 1000"
     # 利用する外部サイト：送信元IPアドレスの特定 or 描画用国旗アイコン
     GET_SOURCE_URL = "https://ifconfig.me/ip"
     GET_FLAGICON_URL = "https://flagcdn.com/w20/"
+    # トラフィック量が多い上位10国: 1点
+    # トラフィック量が多い上位20国: 5点
+    # 上位以外：10点
+    # https://radar.cloudflare.com/traffic
+    COUNTRY_SCORE = {
+        "US": 1,
+        "DE": 1,
+        "IN": 1,
+        "BR": 1,
+        "GB": 1,
+        "JP": 1,
+        "ID": 1,
+        "CN": 1,
+        "VN": 1,
+        "NL": 1,
+        "FR": 5,
+        "SG": 5,
+        "CA": 5,
+        "TH": 5,
+        "TR": 5,
+        "KR": 5,
+        "ES": 5,
+        "RU": 5,
+        "MX": 5,
+        "PH": 5,
+    }
+
+
+# 実行時に決まる変数
+class Config:
+    CITY_DB = None
+    ASN_DB = None
+    HOME_LAT = None
+    HOME_LON = None
+    DEBUG = False
+
+
+def build_history_entry(host, hops):
+
+    no_response = {
+        "host": host,
+        "total_score": 0,
+        "max_rtt": 0,
+        "min_rtt": 9999,
+        "unique_countries": 0,
+        "hop_count": 0,
+        "countries": [],
+    }
+
+    if not hops:
+        return no_response
+
+    # 送信元国（Hop 0）を取得
+    source_country = None
+    if hops[0].get("Country") not in [None, "unknown", "", 0, "0", 0.0]:
+        if Config.DEBUG:
+            st.code(f"Source Country: {hops[0].get('Country')}")
+        source_country = hops[0].get("Country")
+
+    # ping NGの場合を除外
+    if hops[-1].get("RTT") in [None, "unknown", "", 0, "0", 0.0]:
+        return no_response
+
+    # スコア対象の国は Hop 0 (送信元) を除外
+    # 不明な国も除外
+    # RTTが不明、ゼロも除外
+    countries = [
+        h["Country"]
+        for h in hops
+        if str(h.get("Hop")) != "0"
+        and h.get("Country") not in [None, "unknown", ""]
+        and h.get("RTT") not in [None, "unknown", "", 0, "0", 0.0]
+    ]
+
+    counts = Counter(countries)
+
+    # RTTがゼロを除外
+    rtts = [
+        float(h["RTT"])
+        for h in hops
+        if str(h.get("Hop")) != "0"
+        and h.get("RTT") not in [None, "unknown", "", 0, "0", 0.0]
+    ]
+
+    max_rtt = max(rtts) if rtts else 0.0
+    min_rtt = min(rtts) if rtts else 9999
+    unique_countries = len(counts)
+    hop_count = int(hops[-1].get("Hop", 0))
+
+    total_score = 0
+    history = []
+
+    # 経由国・宛先国を加点
+    for c, cnt in counts.items():
+        if c == source_country:
+            score = 0
+        else:
+            # デフォルト 10点
+            score = Params.COUNTRY_SCORE.get(c, 10)
+
+        total_score += cnt * score
+
+        history.append(
+            {
+                "country": c,
+                "count": cnt,
+                "score": score,
+            }
+        )
+
+    return {
+        "host": host,
+        "total_score": total_score,
+        "max_rtt": round(max_rtt, 2),
+        "min_rtt": round(min_rtt, 2),
+        "unique_countries": unique_countries,
+        "hop_count": hop_count,
+        "countries": history,
+    }
+
+
+def render_history_sidebar():
+    st.sidebar.markdown("## Summary")
+
+    if "history" not in st.session_state or not st.session_state.history:
+        st.sidebar.write("No history")
+        st.session_state.history = []
+        st.session_state.history_hosts = {}
+        return
+
+    entry_count = len(st.session_state.history)
+    total_score = 0
+    max_rtt = 0
+    min_rtt = 9999
+    max_hop_count = 0
+    country_stats = defaultdict(lambda: {"count": 0, "score": 0})
+
+    for item in st.session_state.history:
+        total_score += item["total_score"]
+        max_rtt = max(max_rtt, item["max_rtt"])
+        min_rtt = min(min_rtt, item["min_rtt"])
+        max_hop_count = max(max_hop_count, item["hop_count"])
+        for h in item["countries"]:
+            country = h["country"]
+            country_stats[country]["count"] += h["count"]
+            country_stats[country]["score"] = h["score"]
+
+    st.sidebar.markdown(f"**Total Score:** {total_score}")
+    st.sidebar.markdown(f"**Max RTT:** {max_rtt} ms")
+    st.sidebar.markdown(f"**Min RTT:** {min_rtt} ms")
+    st.sidebar.markdown(f"**Max Hop Count:** {max_hop_count}")
+    st.sidebar.markdown(f"**Unique Countries:** {len(list(country_stats.keys()))}")
+    st.sidebar.markdown(f"**Entry Count:** {entry_count}")
+    st.sidebar.markdown("---")
+
+    st.sidebar.markdown("### Country History")
+
+    for country in list(country_stats.keys()):
+
+        flag_url = f"{Params.GET_FLAGICON_URL}{country.lower()}.png"
+        col1, col2 = st.sidebar.columns([1, 3])
+        with col1:
+            st.image(flag_url, width=30)
+
+        with col2:
+            st.markdown(
+                f"{country} ({country_stats[country]['score']:2}) x {country_stats[country]['count']:3}"
+            )
+
+    st.sidebar.markdown("---")
+
+    for key in list(st.session_state.history_hosts.keys()):
+        st.sidebar.markdown(f"### Host History ({key})")
+        for host in st.session_state.history_hosts[key]:
+            st.sidebar.markdown(f"{host}")
+    return
 
 
 def allowed_gai_family():
     """
     socket.getaddrinfo() が返すアドレスファミリーを
-    IPv4 (AF_INET) のみに制限します。
+    IPv4 (AF_INET) のみに制限
     IPV6対応は、別途実施
     """
     family = socket.AF_INET
@@ -117,6 +298,7 @@ def multiple_location(lat, lon, location):
 
 
 def rtt_to_color(rtt):
+    # RTT を色分けで表示
     if rtt is None:
         return "#888888"
     if rtt < 30:
@@ -262,10 +444,12 @@ def read_database(ip, city_db, asn_db):
                 data["org"] = data["org"][: limit - 3] + "..."
 
         except Exception:
-            print(f"Cannot Find data from {ip} on ASN_DB")
+            if Config.DEBUG:
+                st.code(f"Cannot Find data from {ip} on ASN_DB")
             # continue
     except Exception:
-        print(f"Cannot Find data from {ip} on CITY_DB")
+        if Config.DEBUG:
+            st.code(f"Cannot Find data from {ip} on CITY_DB")
 
     return data
 
@@ -278,10 +462,11 @@ def get_sourceip():
 
     # 変更後、requests.get() を実行
     try:
-        ip = requests.get(GET_SOURCE_URL, timeout=3).text.strip()
+        ip = requests.get(Params.GET_SOURCE_URL, timeout=3).text.strip()
 
     except requests.exceptions.RequestException as e:
-        print(f"リクエスト中にエラーが発生しました: {e}")
+        if Config.DEBUG:
+            st.code(f"リクエスト中にエラーが発生しました: {e}")
 
     return ip
 
@@ -290,7 +475,7 @@ def run_folium(hops):
     setlocations = []
 
     m = folium.Map(
-        location=[HOME_LAT, HOME_LON],
+        location=[Config.HOME_LAT, Config.HOME_LON],
         zoom_start=Params.DEFAULT_ZOOM_LEVEL,
         tiles="Cartodb Positron",
         world_copy_jump=False,
@@ -303,11 +488,9 @@ def run_folium(hops):
     last_lon = 140
 
     def shift_lon(lon, last_lon):
-        #        print(f"before {lon},{last_lon}")
         if abs(lon - last_lon) > abs(lon + 360 - last_lon):
             lon += 360
         last_lon = lon
-        #        print(f"after {lon},{last_lon}")
         return lon, last_lon
 
     for i, hop in enumerate(hops):
@@ -319,9 +502,9 @@ def run_folium(hops):
                 continue
 
             if hop["Country"]:
-                png = f"{GET_FLAGICON_URL}{hop['Country'].lower()}.png"
+                png = f"{Params.GET_FLAGICON_URL}{hop['Country'].lower()}.png"
             else:
-                png = f"{GET_FLAGICON_URL}un.png"
+                png = f"{Params.GET_FLAGICON_URL}un.png"
 
             pophtml = FORMAT_HTML_POP.format(
                 color="black",
@@ -445,13 +628,37 @@ def numeric(df):
     return df
 
 
+def clear_all():
+    st.session_state.history = []
+    st.session_state.history_hosts = {"ping": set(), "trace": set()}
+    return
+
+
 def main():
+    if Config.DEBUG:
+        st.subheader("Debug")
+        st.write("Session State")
+        st.json(st.session_state)
+
+    hops = []
+
     lang = st.sidebar.selectbox("Language", ["English", "日本語"])
     lang = "en" if lang == "English" else "ja"
 
-    hops = []
-    city_db = geoip2.database.Reader(CITY_DB)
-    asn_db = geoip2.database.Reader(ASN_DB)
+    st.sidebar.button("Clear History", on_click=clear_all)
+
+    if "history" not in st.session_state:
+        clear_all()
+
+    if "city_db" not in st.session_state:
+        st.session_state.city_db = geoip2.database.Reader(Config.CITY_DB)
+
+    if "asn_db" not in st.session_state:
+        st.session_state.asn_db = geoip2.database.Reader(Config.ASN_DB)
+
+    city_db = st.session_state.city_db
+    asn_db = st.session_state.asn_db
+
     st.session_state.setdefault("running", False)
     st.session_state.setdefault("target_host", "")
     st.session_state.setdefault("run_state", "")
@@ -469,7 +676,7 @@ def main():
         st.session_state.run_state = "trace"
         st.session_state.running = True
 
-    col1, col2, col3, col4 = st.columns([4, 1, 2, 1])
+    col1, col2, col3, col4 = st.columns([4, 2, 2, 1])
     with col1:
         target = st.text_input(
             TEXT["input_destination"][lang],
@@ -520,34 +727,50 @@ def main():
                 f"{TEXT['guidance'][lang]}\n- {TEXT['target'][lang]}：{host} \n - {TEXT['source'][lang]}：{sip}\n"
             )
 
-        if st.session_state.run_state == "ping":
-            hops = run_ping(host, hops, city_db, asn_db)
-            hops_df = pd.DataFrame(hops)
+        def display_hops(host, hops, run_state):
+            if run_state == "ping":
+                hops = run_ping(host, hops, city_db, asn_db)
+            elif run_state == "trace":
+                hops = run_traceroute(host, hops, city_db, asn_db)
 
-            st.dataframe(hops_df)
-            hops_df = numeric(hops_df)
-            print(hops_df)
-            # df が traceroute 結果などの DataFrame として
-            if hops:
-                run_folium(hops)
-            st.success(f"{TEXT["finish_ping"][lang]} ✅")
-            st.session_state.running = False
-            st.session_state.run_state = ""
-
-        if st.session_state.run_state == "trace":
-            hops = run_traceroute(host, hops, city_db, asn_db)
             hops_df = pd.DataFrame(hops)
             hops_df = numeric(hops_df)
             st.dataframe(hops_df)
-            print(hops_df)
             if hops:
+                # メイン画面に地図表示
                 run_folium(hops)
-            st.success(f"{TEXT["finish_trace"][lang]} ✅")
+                # history_hostsのキーをチェック
+                if run_state not in list(st.session_state.history_hosts.keys()):
+                    st.session_state.history_hosts[run_state] = set()
+                # ping or trace で実行されたhost の場合は、履歴の格納をスキップ
+                if host not in st.session_state.history_hosts[run_state]:
+                    # サイドバー向けに履歴情報を集計
+                    entry = build_history_entry(host, hops)
+                    # 結果をhistoryに格納
+                    st.session_state.history.append(entry)
+                    # 結果をhistory_hostsに格納
+                    st.session_state.history_hosts[run_state].add(host)
+
+            st.success(f"{TEXT[f"finish_{run_state}"][lang]} ✅")
             st.session_state.running = False
             st.session_state.run_state = ""
 
-    city_db.close()
-    asn_db.close()
+            return
+
+        if st.session_state.run_state != "":
+            display_hops(host, hops, st.session_state.run_state)
+
+    # サイドバーに履歴表示
+    render_history_sidebar()
+
+    if Config.DEBUG:
+        st.subheader("Debug")
+        st.write("Session State")
+        st.json(st.session_state)
+        st.write("Hops")
+        st.write(hops)
+
+    return
 
 
 def argv_check():
@@ -555,6 +778,12 @@ def argv_check():
         prog="pingquest.py",
         add_help=False,
         description="Ping Quest: visualize ping/traceroute results on a world map.",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode",
     )
 
     parser.add_argument(
@@ -581,11 +810,7 @@ def argv_check():
 
     args, _ = parser.parse_known_args()
 
-    geoip_dir = args.geoip_dir or os.environ.get("GEOIP_DIR")
-    map_home_lat = args.map_home_lat or os.environ.get("MAP_HOME_LAT")
-    map_home_lon = args.map_home_lon or os.environ.get("MAP_HOME_LON")
-
-    return (geoip_dir, map_home_lat, map_home_lon)
+    return (args.geoip_dir, args.map_home_lat, args.map_home_lon, args.debug)
 
 
 def early_cli_check() -> None:
@@ -601,27 +826,29 @@ def early_cli_check() -> None:
 
 
 def run_once():
-    GEOIP_DIR, HOME_LAT, HOME_LON = argv_check()
-    CITY_DB = f"{GEOIP_DIR}/{Params.CITY_DB_NAME}"
-    ASN_DB = f"{GEOIP_DIR}/{Params.ASN_DB_NAME}"
-    GET_SOURCE_URL = Params.GET_SOURCE_URL
-    GET_FLAGICON_URL = Params.GET_FLAGICON_URL
+
+    Config.GEOIP_DIR, Config.HOME_LAT, Config.HOME_LON, Config.DEBUG = argv_check()
+    Config.CITY_DB = f"{Config.GEOIP_DIR}/{Params.CITY_DB_NAME}"
+    Config.ASN_DB = f"{Config.GEOIP_DIR}/{Params.ASN_DB_NAME}"
 
     if not "initialized" in st.session_state:
 
         st.session_state.initialized = True
+        st.session_state.setdefault("debug", Config.DEBUG)
 
         early_cli_check()
 
-        print(
-            f"GeoIP directory: {GEOIP_DIR}\n"
-            f"Home position(lat,lot): {HOME_LAT}, {HOME_LON}\n"
-            f"City databse: {CITY_DB}\n"
-            f"Asn databse: {ASN_DB}\n"
+    if Config.DEBUG:
+        st.subheader("Debug")
+        st.code(
+            f"GeoIP directory: {Config.GEOIP_DIR}\n"
+            f"Home position(lat,lot): {Config.HOME_LAT}, {Config.HOME_LON}\n"
+            f"City databse: {Config.CITY_DB}\n"
+            f"Asn databse: {Config.ASN_DB}\n"
         )
 
-        city_db = Path(CITY_DB)
-        asn_db = Path(ASN_DB)
+        city_db = Path(Config.CITY_DB)
+        asn_db = Path(Config.ASN_DB)
 
         if not city_db.exists():
             st.error(f"{Params.CITY_DB_NAME} not found")
@@ -639,9 +866,9 @@ def run_once():
             )
             st.stop()
 
-    return (CITY_DB, ASN_DB, GET_SOURCE_URL, GET_FLAGICON_URL, HOME_LAT, HOME_LON)
+    return
 
 
 if __name__ == "__main__":
-    CITY_DB, ASN_DB, GET_SOURCE_URL, GET_FLAGICON_URL, HOME_LAT, HOME_LON = run_once()
+    run_once()
     main()

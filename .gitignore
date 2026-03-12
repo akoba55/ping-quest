@@ -1,3 +1,4 @@
 data/*.mmdb
+*/*.txt
 __pycache__/
 *.pyc
