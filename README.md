@@ -15,8 +15,8 @@ It allows students to explore how Internet packets travel across the world by co
 
 The tool was originally developed as a **hands-on workshop for high school students and introductory university networking courses**.
 
-Download and watch the demo video:
-[Ping Quest Demo Video](docs/PingQuestDemo.mp4)
+Watch the demo video:
+[Ping Quest Demo Video](https://www.youtube.com/watch?v=b2Y6jiIsHZU)
 
 # Overview
 ## インターネットを探検しよう
@@ -359,5 +359,4 @@ Ping Quest is suitable for:
 MIT License
 
 # Author 
-Atsushi Kobayashi
-Shonan Institute of Technology
+Atsushi Kobayashi, Shonan Institute of Technology
